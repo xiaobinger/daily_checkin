@@ -1,0 +1,7 @@
+{
+  "task_name": "Marvis_DailyCheckin",
+  "schedule_time": "09:00",
+  "python_path": "C:/Users/admin/AppData/Local/Programs/Python/Python314/python.exe",
+  "script_path": "E:/Desktop/每日积分签到/daily_checkin.py",
+  "script_args": ""
+}
