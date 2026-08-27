@@ -9,9 +9,9 @@ AIGC:
     ReservedCode2: +JBfoaKxI4thEdL+29kn9nHo9WAvnqlh8/bgRkZebgamhXfmcpKPWbsQsLKckSuOakHb+h0vyWbIqKWB7vz6KmsnTMLI3N9otrz+9YgdicW1+Wf0stdQ+8YlWiV5gHy3FRWJlPVM/vjjZ/Vf4PfH6WxvEMVz+Ct6GdtKredwDzVLgAaxa215KDeIeMQ=
 ---
 
-# TraeWorkCN + WorkBuddy 每日自动签到
+# TraeWorkCN + WorkBuddy + MiniMax Code + Qoder CN 每日自动签到
 
-一个脚本同时覆盖两个应用的每日签到，只依赖 Python 标准库，无第三方包。
+一个脚本同时覆盖四个应用的每日签到/积分领取，只依赖 Python 标准库，无第三方包。
 
 ## 文件说明
 
@@ -25,9 +25,11 @@ AIGC:
 ## 运行方式
 
 ```bat
-python daily_checkin.py                :: 两个应用都签到
+python daily_checkin.py                :: 四个应用都签到
 python daily_checkin.py --workbuddy-only
 python daily_checkin.py --trae-only
+python daily_checkin.py --minimax-only
+python daily_checkin.py --qoder-only
 python daily_checkin.py --check-only   :: 只查状态，不领取
 ```
 
@@ -67,6 +69,25 @@ python trae_login.py
 }
 ```
 
+## 3. MiniMax Code（开箱即用）
+
+依赖本机 MiniMax Code 桌面端登录态文件（默认 `%APPDATA%\MiniMax\minimax-agent-cn-config.json`）。
+
+accessToken 为客户端签发 JWT（约 7 天有效），过期后需打开一次 MiniMax Code 让客户端续签。脚本复现桌面端请求签名（`x-signature = md5(unix秒 + salt + body)` + 设备参数），每日领取 400+ 积分。签到接口幂等，重复领取返回同一 `claim_id`，脚本同时以本地 `claim_id` 记录做二次去重。
+
+只要桌面端登录过即可直接运行，无需额外配置。
+
+## 4. Qoder CN（开箱即用）
+
+依赖本机 Qoder CN / QoderWork CN 桌面端登录态，脚本自动读取并解密：
+
+- AES-256-GCM 密钥：`%APPDATA%\QoderCN\Local State` 的 `os_crypt.encrypted_key`（DPAPI 保护，纯 Python 解密）
+- 登录态：`%APPDATA%\QoderCN\User\globalStorage\state.vscdb` 的 `secret://aicoding.auth.userInfo`（Chromium v10 密文）
+
+调用 `https://openapi.qoder.com.cn` 活动接口：先 `GET /api/v2/activity/claim/eligibility` 查询可领取活动，再对每个可领取活动 `POST /api/v2/activity/claim?activityId=...` 完成领取。
+
+token（`dt-xxx` 格式）由客户端自动续签，过期后需打开一次 Qoder CN 让客户端续期。支持多活动批量领取，结果逐条报告。
+
 ## 配置文件（checkin_config.json）
 
 计划任务的三项配置统一由同目录 `checkin_config.json` 管理，改完配置后**自动同步**到计划任务，无需手动改计划任务：
@@ -75,7 +96,7 @@ python trae_login.py
 |------|------|
 | `schedule_time` | 每日执行时间（24 小时制，如 `09:00`） |
 | `python_path` | 启动程序路径（Python 解释器 `python.exe`） |
-| `script_args` | 签到脚本参数；不写=三应用全量，可填 `--workbuddy-only` / `--trae-only` / `--minimax-only` |
+| `script_args` | 签到脚本参数；不写=四应用全量，可填 `--workbuddy-only` / `--trae-only` / `--minimax-only` / `--qoder-only` |
 | `task_name` | 计划任务名（默认 `Marvis_DailyCheckin`） |
 | `script_path` | 签到主脚本路径 |
 

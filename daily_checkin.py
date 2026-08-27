@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TraeWorkCN (TRAE SOLO CN) + WorkBuddy + MiniMax Code 每日自动签到脚本
-====================================================================
+TraeWorkCN (TRAE SOLO CN) + WorkBuddy + MiniMax Code + Qoder CN 每日自动签到脚本
+===============================================================================
 功能：
   1. WorkBuddy    —— 读取本机桌面端登录态，调官方签到接口领取每日积分（开箱即用）
   2. TraeWorkCN   —— 读取 auths/trae-*.json 凭证（traework2api 兼容格式），调官方签到接口
                      领取每日 Work 专属积分；accessToken 临近过期时自动用 refreshToken 轮换
   3. MiniMax Code —— 读取本机登录态 minimax-agent-cn-config.json，复现桌面端请求
                      （x-signature = md5(unix秒 + salt + body) + 设备参数）领取每日 400+ 积分
+  4. Qoder CN     —— 读取本机 Qoder CN / QoderWork CN 登录态（Chromium vscdb + AES-GCM 解密），
+                     调 openapi.qoder.com.cn 活动接口领取每日 Credits 资源包
 
 用法：
-  python daily_checkin.py                 # 三个应用都签到
+  python daily_checkin.py                 # 四个应用都签到
   python daily_checkin.py --workbuddy-only
   python daily_checkin.py --trae-only
   python daily_checkin.py --minimax-only
+  python daily_checkin.py --qoder-only
   python daily_checkin.py --check-only    # 只查询今日签到状态，不执行领取
 
 依赖：Python 3.6+，仅标准库，无第三方包。
@@ -31,10 +34,12 @@ MiniMax Code 说明：
   签到接口每日幂等（重复领取返回同一 claim_id，不重复计分），脚本同时以本地 claim_id
   记录做二次去重。
 """
+import ctypes
 import glob
 import hashlib
 import json
 import os
+import sqlite3
 import ssl
 import sys
 import time
@@ -56,6 +61,11 @@ MINIMAX_HOST = "https://agent.minimaxi.com"
 MINIMAX_SIGN_SALT = "I*7Cf%WZ#S&%1RlZJ&C2"     # 静态 JS 内联的签名盐（chunk 4193）
 MINIMAX_CONFIG_BASENAME = os.path.join("MiniMax", "minimax-agent-cn-config.json")
 
+QODER_OPENAPI_HOST = "https://openapi.qoder.com.cn"
+QODER_VSCDB_BASENAME = os.path.join("QoderCN", "User", "globalStorage", "state.vscdb")
+QODER_LOCAL_STATE_BASENAME = os.path.join("QoderCN", "Local State")
+QODER_USERINFO_KEY = "secret://aicoding.auth.userInfo"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAE_AUTH_DIR = os.path.join(SCRIPT_DIR, "auths")
 TRAE_AUTH_FILE = os.environ.get(
@@ -63,10 +73,14 @@ TRAE_AUTH_FILE = os.environ.get(
 LOG_FILE = os.path.join(SCRIPT_DIR, "checkin.log")
 STATE_FILE = os.path.join(SCRIPT_DIR, "checkin_state.json")
 
+APPDATA = os.environ.get("APPDATA", "")
+LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+
 CHECK_ONLY = "--check-only" in sys.argv
-DO_WORKBUDDY = "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv
-DO_TRAE = "--workbuddy-only" not in sys.argv and "--minimax-only" not in sys.argv
-DO_MINIMAX = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv
+DO_WORKBUDDY = "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
+DO_TRAE = "--workbuddy-only" not in sys.argv and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
+DO_MINIMAX = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--qoder-only" not in sys.argv
+DO_QODER = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv
 
 
 def log(msg):
@@ -586,6 +600,232 @@ def minimax_checkin():
             "report": "领取成功 +%s 积分" % points}
 
 
+# ==================== Qoder CN 每日积分领取 ====================
+# 登录态存储在 Qoder CN 客户端的 Chromium 加密数据库 (vscdb) 中,
+# 密文前缀 v10, 由 Local State 的 os_crypt.encrypted_key (DPAPI 保护) 解出 AES-256-GCM 密钥。
+# 接口: GET /api/v2/activity/claim/eligibility 查可领取活动;
+#       POST /api/v2/activity/claim?activityId=... 领取。
+
+def _qoder_sbox():
+    def gmul(a, b):
+        r = 0
+        for _ in range(8):
+            if b & 1: r ^= a
+            a <<= 1
+            if a & 0x100: a ^= 0x11b
+            b >>= 1
+        return r
+    inv = [0] * 256
+    for a in range(1, 256):
+        for b in range(1, 256):
+            if gmul(a, b) == 1:
+                inv[a] = b
+                break
+    sb = [0x63]
+    for a in range(1, 256):
+        x = inv[a]
+        s = x ^ ((x << 1) | (x >> 7)) ^ ((x << 2) | (x >> 6)) ^ ((x << 3) | (x >> 5)) ^ ((x << 4) | (x >> 4))
+        sb.append((s ^ 0x63) & 0xff)
+    return sb
+
+_QODER_SBOX = _qoder_sbox()
+_QODER_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+
+
+def _qoder_aes_expand(key):
+    nk = len(key) // 4
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nk + 7)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = t[1:] + t[:1]
+            t = [_QODER_SBOX[b] for b in t]
+            t[0] ^= _QODER_RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            t = [_QODER_SBOX[b] for b in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return w, nk + 6
+
+
+def _qoder_aes_gmul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1: r ^= a
+        a <<= 1
+        if a & 0x100: a ^= 0x11b
+        b >>= 1
+    return r & 0xff
+
+
+def _qoder_aes_crypt(block, w, nr):
+    s = list(block)
+    def addrk(r):
+        for c in range(4):
+            for i in range(4):
+                s[4 * c + i] ^= w[r * 4 + c][i]
+    addrk(0)
+    for rnd in range(1, nr + 1):
+        s = [_QODER_SBOX[b] for b in s]
+        t = list(s)
+        for c in range(4):
+            for i in range(4):
+                t[4 * c + i] = s[4 * ((c + i) % 4) + i]
+        s = t
+        if rnd != nr:
+            for c in range(4):
+                col = s[4 * c:4 * c + 4]
+                s[4 * c + 0] = _qoder_aes_gmul(col[0], 2) ^ _qoder_aes_gmul(col[1], 3) ^ col[2] ^ col[3]
+                s[4 * c + 1] = col[0] ^ _qoder_aes_gmul(col[1], 2) ^ _qoder_aes_gmul(col[2], 3) ^ col[3]
+                s[4 * c + 2] = col[0] ^ col[1] ^ _qoder_aes_gmul(col[2], 2) ^ _qoder_aes_gmul(col[3], 3)
+                s[4 * c + 3] = _qoder_aes_gmul(col[0], 3) ^ col[1] ^ col[2] ^ _qoder_aes_gmul(col[3], 2)
+        addrk(rnd)
+    return bytes(s)
+
+
+def _qoder_gcm_gfmul(x, y):
+    r = 0
+    v = x
+    for i in range(128):
+        if y & (1 << (127 - i)):
+            r ^= v
+        v = (v >> 1) ^ (0xe1000000000000000000000000000000 if v & 1 else 0)
+    return r
+
+
+def _qoder_gctr(key, icb, data):
+    w, nr = _qoder_aes_expand(key)
+    out = b""
+    cb = list(icb)
+    for i in range(0, len(data), 16):
+        out += bytes(x ^ y for x, y in zip(data[i:i + 16], _qoder_aes_crypt(cb, w, nr)))
+        cb[-1] = (cb[-1] + 1) & 0xff
+        if cb[-1] == 0:
+            for j in range(len(cb) - 2, -1, -1):
+                cb[j] = (cb[j] + 1) & 0xff
+                if cb[j]:
+                    break
+    return out
+
+
+def _qoder_gcm_inc(cb):
+    cb = list(cb)
+    cb[-1] = (cb[-1] + 1) & 0xff
+    if cb[-1] == 0:
+        for j in range(len(cb) - 2, -1, -1):
+            cb[j] = (cb[j] + 1) & 0xff
+            if cb[j]:
+                break
+    return cb
+
+
+def _qoder_gcm_decrypt(key, nonce, ct, tag):
+    w, nr = _qoder_aes_expand(key)
+    h = int.from_bytes(_qoder_aes_crypt([0] * 16, w, nr), "big")
+    j0 = nonce + b"\x00\x00\x00\x01"
+    pt = _qoder_gctr(key, _qoder_gcm_inc(j0), ct)
+    buf = ct + b"\x00" * ((16 - len(ct) % 16) % 16) + (0).to_bytes(8, "big") + (len(ct) * 8).to_bytes(8, "big")
+    s = 0
+    for i in range(0, len(buf), 16):
+        blk = buf[i:i + 16]
+        if len(blk) < 16:
+            blk = blk + b"\x00" * (16 - len(blk))
+        s = _qoder_gcm_gfmul(s ^ int.from_bytes(blk, "big"), h)
+    ekj0 = _qoder_gctr(key, list(j0), b"\x00" * 16)
+    calc = bytes(a ^ b for a, b in zip(s.to_bytes(16, "big"), ekj0))
+    return pt, calc == tag
+
+
+def _qoder_dpapi_unprotect(data):
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.c_void_p)]
+    buf = ctypes.create_string_buffer(data, len(data))
+    inp = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.c_void_p))
+    out = DATA_BLOB()
+    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+        return ctypes.string_at(out.pbData, out.cbData)
+    return None
+
+
+def _qoder_load_aes_key():
+    ls_path = os.path.join(APPDATA, QODER_LOCAL_STATE_BASENAME)
+    if not os.path.isfile(ls_path):
+        return None
+    ls = json.load(open(ls_path, encoding="utf-8"))
+    ek = ls.get("os_crypt", {}).get("encrypted_key")
+    if not ek:
+        return None
+    raw = __import__("base64").b64decode(ek)
+    if raw[:5] != b"DPAPI":
+        return None
+    return _qoder_dpapi_unprotect(raw[5:])
+
+
+def qoder_find_config():
+    aes_key = _qoder_load_aes_key()
+    if not aes_key:
+        return None
+    vscdb_path = os.path.join(APPDATA, QODER_VSCDB_BASENAME)
+    if not os.path.isfile(vscdb_path):
+        return None
+    db = sqlite3.connect(vscdb_path)
+    row = db.execute("SELECT value FROM ItemTable WHERE key=?", (QODER_USERINFO_KEY,)).fetchone()
+    db.close()
+    if not row:
+        return None
+    buf = bytes(json.loads(row[0])["data"])
+    if buf[:3] != b"v10":
+        return None
+    pt, ok = _qoder_gcm_decrypt(aes_key, buf[3:15], buf[15:-16], buf[-16:])
+    if not ok:
+        return None
+    return json.loads(pt.decode("utf-8"))
+
+
+def qoder_checkin():
+    cfg = qoder_find_config()
+    if not cfg:
+        return {"app": "QoderCN", "result": "NO_SESSION",
+                "report": "未找到 Qoder CN 登录态（%s），请先登录桌面端" % QODER_VSCDB_BASENAME}
+    token = cfg.get("token")
+    if not token:
+        return {"app": "QoderCN", "result": "NO_SESSION", "report": "登录态中缺少 token"}
+    exp = cfg.get("expireTime")
+    if exp and int(exp) < int(time.time() * 1000):
+        return {"app": "QoderCN", "result": "NO_SESSION",
+                "report": "登录态已过期（expireTime），请重新打开 Qoder CN 续签"}
+    hdrs = {"Authorization": "Bearer " + token, "User-Agent": "QoderCN/1.0", "Accept-Language": "zh-CN"}
+    code, body = get(QODER_OPENAPI_HOST + "/api/v2/activity/claim/eligibility", hdrs)
+    if code != 200 or not isinstance(body, dict):
+        return {"app": "QoderCN", "result": "ERROR",
+                "report": "查询可领取活动失败（HTTP %s）" % code}
+    if body.get("code") != 0:
+        return {"app": "QoderCN", "result": "ERROR",
+                "report": "查询可领取活动失败（code=%s, msg=%s）" % (body.get("code"), body.get("msg"))}
+    activities = body.get("data") or []
+    if not activities:
+        return {"app": "QoderCN", "result": "NOT_YET", "report": "当前无可领取的活动"}
+    if CHECK_ONLY:
+        claimable = [a for a in activities if a.get("canClaim") is True]
+        return {"app": "QoderCN", "result": "NOT_YET",
+                "report": "发现 %d 个可领取活动（共 %d 个）" % (len(claimable), len(activities))}
+    results = []
+    for act in activities:
+        if act.get("canClaim") is not True:
+            continue
+        aid = act.get("activityId", "")
+        tip = (act.get("tipText") or {}).get("zh") or ""
+        ccode, cbody = post(QODER_OPENAPI_HOST + "/api/v2/activity/claim?activityId=" + urllib.parse.quote(aid), hdrs)
+        if ccode == 200 and isinstance(cbody, dict) and cbody.get("code") == 0:
+            results.append("OK[%s]%s" % (aid, tip))
+        else:
+            results.append("FAIL[%s](%s)" % (aid, cbody.get("msg", ccode)))
+    if not results:
+        return {"app": "QoderCN", "result": "ALREADY", "report": "没有可领取的活动"}
+    ok_cnt = sum(1 for r in results if r.startswith("OK"))
+    return {"app": "QoderCN", "result": "OK" if ok_cnt == len(results) else "ERROR",
+            "report": "领取 %d/%d：%s" % (ok_cnt, len(results), "；".join(results))}
+
+
 # ==================== 主流程 ====================
 def main():
     log("==== 每日自动签到开始 ====")
@@ -596,6 +836,8 @@ def main():
         outputs.append(traework_checkin())
     if DO_MINIMAX:
         outputs.append(minimax_checkin())
+    if DO_QODER:
+        outputs.append(qoder_checkin())
     for r in outputs:
         log("[%s] %s: %s" % (r["app"], r["result"], r["report"]))
     log("==== 签到结束 ====")
