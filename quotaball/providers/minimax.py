@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""MiniMax Code：读本机登录态，复现桌面端签名，查询 7 日签到日历。
+
+实测（S0）：signin/status 只有 days 数组，无余额接口。status==3 表示当日已领取。
+签名与请求逻辑直接复用 daily_checkin.py 的 mm_request（md5(unix+salt+body)），不重写。
+"""
+import json
+import time
+
+import daily_checkin as dc  # noqa: E402
+
+from ..errors import NoSessionError, QuotaError, RetryableError
+from .base import (Provider, mask_account, STATE_ALREADY, STATE_PENDING)
+
+
+class MiniMaxProvider(Provider):
+    key = "minimax"
+    label = "MiniMax Code"
+
+    def _fetch_credit(self, cfg, token):
+        """积分余额：/minimax-cloud/api/v1/credit/details（逐笔额度，含到期时间）。
+
+        实测（2026-09-02）：details 数组每项含 granted_amount / remaining_amount /
+        expire_at_ms（字符串小数）。汇总未过期条目得总余额；reset_at 取最近到期时间
+        ——MiniMax 的积分是「先到期的先扣」，所以最近到期日就是最值得关注的重置点。
+        """
+        try:
+            code, body = dc.mm_request(cfg, token,
+                                       "/minimax-cloud/api/v1/credit/details")
+        except Exception:
+            return []
+        if not isinstance(body, dict):
+            return []
+        details = body.get("details") or []
+        tot = rem = 0.0
+        soonest = None
+        now_ms = time.time() * 1000.0
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            exp = d.get("expire_at_ms") or 0
+            try:
+                exp = float(exp)
+            except (TypeError, ValueError):
+                exp = 0
+            if exp and exp < now_ms:          # 已过期额度不计入
+                continue
+            try:
+                g = float(d.get("granted_amount") or 0)
+                r = float(d.get("remaining_amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            tot += g
+            rem += r
+            if exp and (soonest is None or exp < soonest):
+                soonest = exp
+        if tot <= 0:
+            return []
+        return [self._window(label="积分余额", used=max(tot - rem, 0.0), total=tot,
+                             remaining=rem,
+                             reset_at=(soonest / 1000.0 if soonest else None),
+                             unit="credits")]
+
+    def fetch(self):
+        started = time.time()
+        cfg_path = dc.mm_find_config()
+        if not cfg_path:
+            raise NoSessionError("未找到 MiniMax Code 登录态，请先登录桌面端")
+        try:
+            cfg = json.load(open(cfg_path, encoding="utf-8"))
+            token = dc.mm_load_token(cfg)
+            if not token:
+                raise ValueError("登录态缺少 accessToken（桌面端配置与 .minimax/local-runtime.auth.json 都没有）")
+        except Exception as e:
+            raise NoSessionError("MiniMax Code 登录态解析失败: %s" % e)
+
+        # accessToken 为客户端签发 JWT（约 7 天），过期需打开客户端续签
+        try:
+            _, _, payload = token.split(".")
+            exp_ts = dc.mm_jwt_exp(payload)
+            if exp_ts and time.time() >= exp_ts:
+                raise NoSessionError("MiniMax Code accessToken 已过期，请打开客户端续签")
+        except NoSessionError:
+            raise
+        except Exception:
+            pass
+
+        code, body = dc.mm_request(cfg, token, "/minimax-cloud/api/v1/signin/status")
+        if code in (401, 400):
+            raise NoSessionError("MiniMax Code 登录态失效（HTTP %s），请重新打开客户端" % code)
+        if code < 0:
+            raise RetryableError("MiniMax Code 网络请求失败: %s"
+                                 % (body.get("error") if isinstance(body, dict) else body))
+        if not isinstance(body, dict) or (body.get("base_resp") or {}).get("status_code") != 0:
+            raise QuotaError("MiniMax Code 查询失败（HTTP %s）: %s"
+                             % (code, json.dumps(body, ensure_ascii=False)[:160]))
+
+        days = ((body.get("data") or {}).get("days")) or []
+        today = next((d for d in days if d.get("is_today")), None)
+        points = (today or {}).get("points", 0)
+        checked = (today or {}).get("status") == 3
+
+        user = cfg.get("user") or {}
+        who = user.get("nickname") or user.get("userName") or user.get("realUserID") or ""
+        return [self._record(
+            account=mask_account(who),
+            checkin={
+                "state": STATE_ALREADY if checked else STATE_PENDING,
+                "today_gain": points if checked else None,
+                "streak_days": None,
+            },
+            quota=self._fetch_credit(cfg, token), absolute=None,
+            note=None if checked else ("今日可领 +%s" % points if points else None),
+            started=started)]

@@ -42,10 +42,29 @@ import os
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from quotaball import wbatrest  # noqa: E402  WorkBuddy 5.7+ 登录态信封解密
+
+# SSL context 全局单例：ssl.create_default_context() 在 Windows 上并发调用会
+# access violation（Schannel 初始化非线程安全）。悬浮球的采集层用多线程并发
+# 请求，多个线程同时 create 会崩溃。这里加锁惰性单例，只初始化一次。
+_ssl_lock = threading.Lock()
+_ssl_ctx = None
+
+
+def _default_ssl_context():
+    global _ssl_ctx
+    if _ssl_ctx is None:
+        with _ssl_lock:
+            if _ssl_ctx is None:
+                _ssl_ctx = ssl.create_default_context()
+    return _ssl_ctx
 
 # ==================== 配置 ====================
 WORKBUDDY_ENDPOINT = "https://copilot.tencent.com"
@@ -81,6 +100,8 @@ DO_WORKBUDDY = "--trae-only" not in sys.argv and "--minimax-only" not in sys.arg
 DO_TRAE = "--workbuddy-only" not in sys.argv and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
 DO_MINIMAX = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--qoder-only" not in sys.argv
 DO_QODER = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv
+DO_LOBSTER = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv \
+    and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
 
 
 def log(msg):
@@ -98,7 +119,7 @@ def _request(url, headers, method="GET", payload=None, timeout=30):
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    ctx = ssl.create_default_context()
+    ctx = _default_ssl_context()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             raw = resp.read().decode("utf-8", "replace")
@@ -148,13 +169,28 @@ def wb_find_auth_file():
     return cand if os.path.exists(cand) else None
 
 
+def wb_plain(value):
+    """登录态里的敏感字段：明文直接返回，信封则解密（WorkBuddy 5.7+）。"""
+    if isinstance(value, str):
+        return value
+    if wbatrest.is_envelope(value):
+        try:
+            return wbatrest.open_auth_field(value)
+        except Exception as e:
+            raise RuntimeError("WorkBuddy 登录态信封解密失败: %s" % e)
+    return value
+
+
 def wb_headers(session):
     auth = session.get("auth") or {}
     account = session.get("account") or {}
-    token = auth.get("accessToken")
+    token = os.environ.get("WORKBUDDY_TOKEN") or wb_plain(auth.get("accessToken"))
     uid = account.get("uid")
     if not token or not uid:
-        raise RuntimeError("登录态文件缺少 accessToken / uid")
+        raise RuntimeError(
+            "登录态文件缺少 accessToken / uid（5.7+ 为加密信封，需先执行 "
+            "tools/wb_extract.js 提取密钥并用 tools/wb_cache_key.py 缓存，"
+            "或设置环境变量 WORKBUDDY_TOKEN）")
     headers = {
         "Accept": "application/json",
         "Authorization": "Bearer %s" % token,
@@ -411,6 +447,9 @@ def traework_checkin():
 
 
 # ==================== MiniMax Code 签到 ====================
+MINIMAX_RUNTIME_AUTH = os.path.join(".minimax", "local-runtime.auth.json")
+
+
 def mm_find_config():
     override = os.environ.get("MINIMAX_CONFIG")
     if override and os.path.exists(override):
@@ -419,6 +458,34 @@ def mm_find_config():
         os.path.expanduser("~"), "AppData", "Roaming")
     cand = os.path.join(appdata, MINIMAX_CONFIG_BASENAME)
     return cand if os.path.exists(cand) else None
+
+
+def mm_find_runtime_auth():
+    """本地运行时登录态（3.x 桌面端把 token 挪到了这里）。"""
+    override = os.environ.get("MINIMAX_RUNTIME_AUTH")
+    if override and os.path.exists(override):
+        return override
+    cand = os.path.join(os.path.expanduser("~"), MINIMAX_RUNTIME_AUTH)
+    return cand if os.path.exists(cand) else None
+
+
+def mm_load_token(cfg):
+    """取 accessToken：桌面端配置优先，其次本地运行时登录态。
+
+    实测（2026-10-12）：3.1 桌面端把 tokens 清空了，token 只留在
+    ~/.minimax/local-runtime.auth.json（auth.accessToken）。两个来源都试一遍。
+    """
+    token = (cfg.get("tokens") or {}).get("accessToken")
+    if token:
+        return token
+    path = mm_find_runtime_auth()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return ((json.load(f) or {}).get("auth") or {}).get("accessToken")
+    except Exception:
+        return None
 
 
 def mm_jwt_exp(payload):
@@ -476,7 +543,7 @@ def mm_request(cfg, token, path, method="GET", body=""):
     }
     data = body.encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    ctx = ssl.create_default_context()
+    ctx = _default_ssl_context()
     try:
         with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
             raw = resp.read().decode("utf-8", "replace")
@@ -528,9 +595,9 @@ def minimax_checkin():
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        token = (cfg.get("tokens") or {}).get("accessToken")
+        token = mm_load_token(cfg)
         if not token:
-            raise RuntimeError("登录态缺少 accessToken")
+            raise RuntimeError("登录态缺少 accessToken（已找过桌面端配置与 .minimax/local-runtime.auth.json）")
     except Exception as e:
         return {"app": "MiniMaxCode", "result": "ERROR",
                 "report": "解析登录态失败: %s" % e}
@@ -826,6 +893,140 @@ def qoder_checkin():
             "report": "领取 %d/%d：%s" % (ok_cnt, len(results), "；".join(results))}
 
 
+# ==================== LobsterAI 签到 ====================
+LOBSTER_ENDPOINT = "https://lobsterai-server.youdao.com"
+LOBSTER_CLIENT_VERSION = "2026.9.23"
+LOBSTER_DB_REL = os.path.join("LobsterAI", "lobsterai.sqlite")
+LOBSTER_BIZ = {"NOT_FOUND": 51100, "NOT_ACTIVE": 51101, "LOGIN_REQUIRED": 51102,
+               "ACTION_INVALID": 51103, "ALREADY_CLAIMED": 51104,
+               "CONFIG_INVALID": 51105, "REVISION_MISMATCH": 51106}
+
+
+def lobster_headers(token):
+    return {
+        "Authorization": "Bearer %s" % token,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "LobsterAI/%s" % LOBSTER_CLIENT_VERSION,
+        "Cache-Control": "no-store",
+    }
+
+
+def lobster_kv(con, key):
+    row = con.execute("select value from kv where key=?", (key,)).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def lobster_load_session():
+    """从桌面端 sqlite 读登录态（只读连接，写库走 WAL 不冲突）。"""
+    override = os.environ.get("LOBSTERAI_DB")
+    if override and os.path.exists(override):
+        path = override
+    else:
+        cand = os.path.join(APPDATA or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
+                            LOBSTER_DB_REL)
+        if not os.path.exists(cand):
+            raise RuntimeError("未找到 LobsterAI 登录库（%s），请先登录桌面端" % LOBSTER_DB_REL)
+        path = cand
+    con = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True, timeout=5)
+    try:
+        tokens = lobster_kv(con, "auth_tokens")
+        user = lobster_kv(con, "auth_user")
+    finally:
+        con.close()
+    token = tokens.get("accessToken")
+    if not token:
+        raise RuntimeError("登录态缺少 accessToken，请重新登录桌面端")
+    return token, user
+
+
+def lobster_call(token, path, method="GET", payload=None):
+    """调活动接口，返回 (http_code, body)。业务码交给调用方判断。"""
+    return _request(LOBSTER_ENDPOINT + path, lobster_headers(token),
+                    method=method, payload=payload)
+
+
+def lobster_checkin():
+    try:
+        token, user = lobster_load_session()
+    except Exception as e:
+        return {"app": "LobsterAI", "result": "NO_SESSION", "report": str(e)}
+
+    who = user.get("nickname") or user.get("yid") or "unknown"
+
+    # 1) 活动槽位（活动码与配置版本随灰度变化，每次重新拉）
+    scode, sbody = lobster_call(
+        token,
+        "/api/client-activities/slot?placement=desktop_sidebar"
+        "&clientVersion=%s&containerApiVersion=2&platform=win32" % LOBSTER_CLIENT_VERSION)
+    if scode in (401, 403):
+        return {"app": "LobsterAI", "result": "NO_SESSION",
+                "report": "登录态已失效（HTTP %s），请重新登录桌面端" % scode}
+    if not isinstance(sbody, dict) or sbody.get("code") != 0:
+        return {"app": "LobsterAI", "result": "ERROR",
+                "report": "查询活动失败（HTTP %s）: %s"
+                          % (scode, json.dumps(sbody, ensure_ascii=False)[:160])}
+    slot = sbody.get("data") or {}
+    act = slot.get("activity")
+    if slot.get("slotState") != "available" or not act:
+        return {"app": "LobsterAI", "result": "NOT_YET", "report": "当前无每日签到活动"}
+    if act.get("activityType") != "daily_check_in":
+        return {"app": "LobsterAI", "result": "NOT_YET",
+                "report": "当前活动非每日签到（%s）" % (act.get("activityType") or "未知")}
+    activity_code = act.get("activityCode")
+    revision = act.get("configRevision")
+
+    # 2) 签到状态
+    scode, sbody = lobster_call(
+        token, "/api/client-activities/%s/context?configRevision=%d"
+        % (urllib.parse.quote(activity_code), revision))
+    if not isinstance(sbody, dict) or sbody.get("code") != 0:
+        return {"app": "LobsterAI", "result": "ERROR",
+                "report": "查询签到状态失败（HTTP %s）: %s"
+                          % (scode, json.dumps(sbody, ensure_ascii=False)[:160])}
+    ctx = sbody.get("data") or {}
+    state = ctx.get("state") or {}
+    reward = state.get("rewardCredits") or 0
+    if state.get("claimedToday"):
+        return {"app": "LobsterAI", "result": "ALREADY",
+                "report": "今日已签到（%s），+%s credits，累计 %s 天"
+                          % (who, reward, state.get("claimedDays"))}
+    if CHECK_ONLY:
+        return {"app": "LobsterAI", "result": "NOT_YET", "report": "今日可领 +%s credits" % reward}
+
+    # 3) 领取（configRevision 变化时服务端返回 51106，重新拉一次即可）
+    idem = "daily-checkin-%s-%d" % (time.strftime("%Y%m%d"), int(time.time()))
+    scode, sbody = lobster_call(
+        token, "/api/client-activities/%s/actions/check_in" % urllib.parse.quote(activity_code),
+        method="POST",
+        payload={"configRevision": revision, "idempotencyKey": idem, "payload": {}})
+    if not isinstance(sbody, dict):
+        return {"app": "LobsterAI", "result": "ERROR",
+                "report": "领取响应异常（HTTP %s）: %s"
+                          % (scode, json.dumps(sbody, ensure_ascii=False)[:160])}
+    biz = sbody.get("code")
+    if biz == LOBSTER_BIZ["ALREADY_CLAIMED"]:
+        return {"app": "LobsterAI", "result": "ALREADY", "report": "今日已签到（%s）" % who}
+    if biz == LOBSTER_BIZ["REVISION_MISMATCH"]:
+        return {"app": "LobsterAI", "result": "RETRY",
+                "report": "活动配置已更新（code=51106），请重跑一次"}
+    if biz != 0:
+        return {"app": "LobsterAI", "result": "ERROR",
+                "report": "领取失败（HTTP %s, code=%s）: %s"
+                          % (scode, biz, str(sbody.get("message") or "")[:120])}
+
+    res = (sbody.get("data") or {}).get("result") or {}
+    return {"app": "LobsterAI", "result": "OK",
+            "report": "签到成功（%s）+%s credits，第 %s/%s 天"
+                      % (who, res.get("creditsGranted"), res.get("claimedDays"),
+                         res.get("totalDays"))}
+
+
 # ==================== 主流程 ====================
 def main():
     log("==== 每日自动签到开始 ====")
@@ -838,6 +1039,8 @@ def main():
         outputs.append(minimax_checkin())
     if DO_QODER:
         outputs.append(qoder_checkin())
+    if DO_LOBSTER:
+        outputs.append(lobster_checkin())
     for r in outputs:
         log("[%s] %s: %s" % (r["app"], r["result"], r["report"]))
     log("==== 签到结束 ====")

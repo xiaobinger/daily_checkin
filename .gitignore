@@ -218,3 +218,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 auths/
+
+# ===== 本项目 =====
+# 采集/签到运行时状态（含账号昵称等本机信息）
+quota_state.json
+# 临时探测目录（逆向过程中的草稿，不入库）
+probe/
+# 悬浮球开发期截图
+quotaball/ui/shot_*.png
+# WorkBuddy 桌面端在本目录生成的 agent 记忆
+.workbuddy/

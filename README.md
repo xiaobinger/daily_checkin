@@ -25,7 +25,7 @@ AIGC:
 ## 运行方式
 
 ```bat
-python daily_checkin.py                :: 四个应用都签到
+python daily_checkin.py                :: 五个应用都签到
 python daily_checkin.py --workbuddy-only
 python daily_checkin.py --trae-only
 python daily_checkin.py --minimax-only
@@ -39,6 +39,24 @@ python daily_checkin.py --check-only   :: 只查状态，不领取
 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
 
 只要桌面端登录过即可直接运行，无需额外配置。每日领取 100 积分；已签到会自动跳过（幂等）。
+
+> **WorkBuddy 5.7+ 的加密登录态（已适配）**
+> 5.7 起 `auth.accessToken`、`account.nickname` 等敏感字段改成了
+> `{"$wbEncrypted":1,"envelope":{...}}` 的 AES-256-GCM 信封，解密实现见
+> `quotaball/wbatrest.py`（AAD 绑定 keyId/套件/framing）。
+> 解密密钥（`atRestSecretKey`）由桌面端打过补丁的 Electron 原生模块
+> `electron_browser_workbuddy_storage.loggerGet()` 提供，**磁盘上没有副本**，
+> 需要一次性提取：
+>
+> ```bat
+> :: 1) 退出 WorkBuddy 桌面端
+> node tools\wb_extract.js
+> :: 2) 把输出的 atRestSecretKey 用 DPAPI 缓存到 %LOCALAPPDATA%\quotaball
+> python tools\wb_cache_key.py "<atRestSecretKey>"
+> ```
+>
+> 缓存后每天自动解密，无需重复提取。也可设环境变量 `WORKBUDDY_TOKEN`
+> 直接注入明文 accessToken 作为兜底。
 
 ## 2. TraeWorkCN（需一次性配置凭证）
 
@@ -73,6 +91,10 @@ python trae_login.py
 
 依赖本机 MiniMax Code 桌面端登录态文件（默认 `%APPDATA%\MiniMax\minimax-agent-cn-config.json`）。
 
+> **3.1 版本起 token 换了位置**：桌面端配置里的 `tokens` 已被清空，
+> 实际 token 在 `%USERPROFILE%\.minimax\local-runtime.auth.json` 的 `auth.accessToken`。
+> 脚本两个来源都会读，先桌面端配置、后本地运行时登录态。
+
 accessToken 为客户端签发 JWT（约 7 天有效），过期后需打开一次 MiniMax Code 让客户端续签。脚本复现桌面端请求签名（`x-signature = md5(unix秒 + salt + body)` + 设备参数），每日领取 400+ 积分。签到接口幂等，重复领取返回同一 `claim_id`，脚本同时以本地 `claim_id` 记录做二次去重。
 
 只要桌面端登录过即可直接运行，无需额外配置。
@@ -87,6 +109,22 @@ accessToken 为客户端签发 JWT（约 7 天有效），过期后需打开一�
 调用 `https://openapi.qoder.com.cn` 活动接口：先 `GET /api/v2/activity/claim/eligibility` 查询可领取活动，再对每个可领取活动 `POST /api/v2/activity/claim?activityId=...` 完成领取。
 
 token（`dt-xxx` 格式）由客户端自动续签，过期后需打开一次 Qoder CN 让客户端续期。支持多活动批量领取，结果逐条报告。
+
+## 5. LobsterAI（开箱即用）
+
+登录态来自桌面端 sqlite 库 `%APPDATA%\LobsterAI\lobsterai.sqlite` 的 `kv` 表：
+`auth_tokens`（accessToken + refreshToken，HS512 JWT，约 30 天）、`auth_user`（昵称）。
+
+调用官方活动接口 `https://lobsterai-server.youdao.com`：
+
+| 步骤 | 请求 |
+|------|------|
+| 活动槽位 | `GET /api/client-activities/slot?placement=desktop_sidebar&clientVersion=&containerApiVersion=2&platform=win32` |
+| 签到状态 | `GET /api/client-activities/{activityCode}/context?configRevision=N` |
+| 领取 | `POST /api/client-activities/{activityCode}/actions/check_in`，body `{configRevision, idempotencyKey, payload:{}}` |
+
+活动码与配置版本会随灰度变化，脚本每次都重新拉取，不写死。每日 100 credits，
+业务码 `51104` 表示今日已领、`51106` 表示活动配置已更新（重跑一次即可）。
 
 ## 配置文件（checkin_config.json）
 

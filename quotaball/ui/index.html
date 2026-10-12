@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>quotaball</title>
+<style>
+  :root{
+    --glass: rgba(15,17,23,.86);
+    --line: rgba(255,255,255,.09);
+    --line-strong: rgba(255,255,255,.16);
+    --tx: #e8ebf2;
+    --tx2: #9aa2b1;
+    --tx3: #666e7d;
+    --green:#34d399; --amber:#fbbf24; --red:#f87171;
+    --ease-out: cubic-bezier(.16,1,.3,1);
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{width:100%; height:100%; background:transparent; overflow:hidden;
+    font-family:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+    color:var(--tx); user-select:none; -webkit-user-select:none;
+    font-feature-settings:"tnum" 1;}
+  /* stage 用 inline-flex 由内容撑开，展开前即可测量真实尺寸（不受窗口裁剪） */
+  #stage{display:inline-flex; align-items:flex-start; padding:18px; gap:14px;}
+  #stage.flip{flex-direction:row-reverse;}
+
+  /* ============ 球体 ============
+     透明窗口下的铁律：所有 box-shadow 的扩散范围必须小于 stage 的 18px 边距，
+     否则会被窗口边界硬裁切，在透明画布上就是一圈脏灰边（"重影"）。
+     因此这里只用短shadow + 内阴影/高光来塑造体积，不用大范围投影。 */
+  #ball{position:relative; width:64px; height:64px; flex:none;
+    border-radius:50%;
+    background:radial-gradient(118% 118% at 32% 18%,
+      #39415a 0%, #252b3b 30%, #171b26 58%, #0f1219 82%, #0a0c11 100%);
+    border:1px solid rgba(255,255,255,.11);
+    box-shadow:0 4px 10px rgba(0,0,0,.46),
+               0 1px 2px rgba(0,0,0,.34),
+               inset 0 1px 0 rgba(255,255,255,.20),
+               inset 0 -7px 14px rgba(0,0,0,.36),
+               inset 0 0 0 1px rgba(255,255,255,.035);
+    cursor:pointer;
+    transition:transform .18s var(--ease-out), border-color .18s;}
+  #ball:hover{transform:scale(1.05); border-color:rgba(255,255,255,.30);}
+  #ball:active{transform:scale(.97);}
+  /* 顶部釉面高光 */
+  #ball::before{content:""; position:absolute; top:5%; left:15%; width:70%; height:42%;
+    border-radius:50%;
+    background:radial-gradient(58% 66% at 50% 40%,
+      rgba(255,255,255,.19), rgba(255,255,255,.05) 52%, rgba(255,255,255,0) 74%);
+    pointer-events:none;}
+  /* 底部环境反射光（让球有"落在桌面上"的实感） */
+  #ball::after{content:""; position:absolute; bottom:9%; left:23%; width:54%; height:24%;
+    border-radius:50%;
+    background:radial-gradient(62% 72% at 50% 62%,
+      rgba(146,186,255,.14), rgba(146,186,255,0) 74%);
+    pointer-events:none;}
+  /* 细腻噪点：消除大面积渐变的色带，提升材质感 */
+  .noise{position:absolute; inset:0; border-radius:50%; pointer-events:none;
+    opacity:.05; mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='70' height='70'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='70' height='70' filter='url(%23n)'/%3E%3C/svg%3E");}
+  #ball svg{position:absolute; inset:0; width:100%; height:100%;}
+  #ball .track{stroke:rgba(255,255,255,.08);}
+  #ball .prog{transition:stroke-dashoffset .6s var(--ease-out), stroke .3s, filter .3s;}
+  #ball .center{position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; pointer-events:none; padding-top:1px;}
+  #ball .pct{font-size:15.5px; font-weight:650; letter-spacing:-.02em; line-height:1;
+    text-shadow:0 1px 3px rgba(0,0,0,.5);}
+  #ball .sub{font-size:8px; color:var(--tx2); margin-top:3px; max-width:54px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; letter-spacing:.02em;}
+  #badge{position:absolute; top:2px; right:2px; width:10px; height:10px; border-radius:50%;
+    border:2px solid #12141b; background:var(--green); z-index:2;}
+  /* 待办/异常：呼吸提示（克制的暖色辉光） */
+  body.attn #ball{animation:attnPulse 2.6s ease-in-out infinite;}
+  @keyframes attnPulse{
+    0%,100%{box-shadow:0 8px 24px rgba(0,0,0,.50), 0 2px 6px rgba(0,0,0,.45),
+            inset 0 1px 1px rgba(255,255,255,.10), inset 0 -6px 14px rgba(0,0,0,.35);}
+    50%{box-shadow:0 8px 24px rgba(0,0,0,.50), 0 0 20px rgba(251,191,36,.28),
+        inset 0 1px 1px rgba(255,255,255,.10), inset 0 -6px 14px rgba(0,0,0,.35);}
+  }
+  body.attn.bad #ball{animation-name:attnPulseBad;}
+  @keyframes attnPulseBad{
+    0%,100%{box-shadow:0 8px 24px rgba(0,0,0,.50), 0 2px 6px rgba(0,0,0,.45),
+            inset 0 1px 1px rgba(255,255,255,.10), inset 0 -6px 14px rgba(0,0,0,.35);}
+    50%{box-shadow:0 8px 24px rgba(0,0,0,.50), 0 0 20px rgba(248,113,113,.32),
+        inset 0 1px 1px rgba(255,255,255,.10), inset 0 -6px 14px rgba(0,0,0,.35);}
+  }
+
+  /* ============ 面板 ============ */
+  /* flex:none：收起态窗口仅 76px 宽，面板绝不能被压缩——展开尺寸按其
+     自然尺寸测量；rows 高度用固定 px（vh 会被 76px 小视口钳制） */
+  #panel{position:relative; width:356px; flex:none; margin:2px 0 0 14px; border-radius:18px;
+    background:var(--glass);
+    border:1px solid var(--line-strong);
+    box-shadow:0 16px 52px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.4),
+               inset 0 1px 0 rgba(255,255,255,.06);
+    opacity:0; transform:scale(.96) translateY(6px); transform-origin:left top;
+    transition:opacity .22s var(--ease-out), transform .22s var(--ease-out);
+    pointer-events:none;}
+  #stage.flip #panel{margin:2px 14px 0 0; transform-origin:right top;
+    transform:scale(.96) translateY(6px);}
+  body.expanded #panel{opacity:1; transform:none; pointer-events:auto;}
+  /* 面板顶部一道极细的品牌流光 */
+  #panel::before{content:""; position:absolute; top:0; left:14%; right:14%; height:1px;
+    background:linear-gradient(90deg, transparent, rgba(255,255,255,.28), transparent);
+    border-radius:1px; pointer-events:none;}
+
+  #panel header{display:flex; align-items:center; justify-content:space-between;
+    padding:13px 15px 11px; border-bottom:1px solid var(--line);}
+  #panel header .t{font-size:13px; font-weight:650; letter-spacing:.02em;
+    display:flex; align-items:center; gap:7px;}
+  #panel header .t::before{content:""; width:6px; height:6px; border-radius:50%;
+    background:linear-gradient(135deg, #60a5fa, #a78bfa);
+    box-shadow:0 0 6px rgba(96,165,250,.5);}
+  #panel header .when{font-size:10.5px; color:var(--tx2); margin-top:3px;}
+  #closeBtn{width:24px; height:24px; border:none; border-radius:8px; background:transparent;
+    color:var(--tx2); font-size:13px; cursor:pointer; line-height:1;
+    transition:background .15s, color .15s;}
+  #closeBtn:hover{background:rgba(255,255,255,.08); color:var(--tx);}
+
+  #rows{max-height:440px; overflow-y:auto; scrollbar-width:thin;
+    scrollbar-color:rgba(255,255,255,.14) transparent;
+    scrollbar-gutter:stable;}
+  .row{display:grid; grid-template-columns:30px 1fr auto; gap:11px;
+    padding:11px 15px; border-bottom:1px solid rgba(255,255,255,.05);
+    transition:background .15s;}
+  .row:hover{background:rgba(255,255,255,.028);}
+  .row:last-child{border-bottom:none;}
+  .avatar{width:28px; height:28px; border-radius:9px; display:flex; align-items:center;
+    justify-content:center; font-size:13px; font-weight:650; margin-top:1px;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.12);}
+  .row .name{font-size:12.5px; font-weight:600; letter-spacing:.01em;}
+  .row .acct{font-size:10px; color:var(--tx2); margin-top:1px;}
+  .metric{margin-top:6px;}
+  .absval{font-size:15px; font-weight:650;}
+  .absval .unit{font-size:10.5px; font-weight:400; color:var(--tx2); margin-left:3px;}
+  .wrow{margin-top:5px;}
+  .wrow:first-child{margin-top:0;}
+  .wrow .wl{display:flex; justify-content:space-between; font-size:9.5px; color:var(--tx2);}
+  .wrow .wl b{color:var(--tx); font-weight:500;}
+  .bar{height:4px; border-radius:2px; background:rgba(255,255,255,.07); margin-top:3px;
+    overflow:hidden;}
+  .bar i{display:block; height:100%; border-radius:2px;
+    transition:width .5s var(--ease-out);
+    box-shadow:0 0 6px -1px currentColor;}
+  .note{font-size:10px; color:var(--tx2); margin-top:5px;}
+  .errtext{font-size:10.5px; color:var(--red); margin-top:5px; line-height:1.5;}
+  .right{display:flex; flex-direction:column; align-items:flex-end; gap:5px;}
+  .chip{display:inline-flex; align-items:center; gap:4px; font-size:10px;
+    padding:2px 8px; border-radius:99px; background:rgba(255,255,255,.05);
+    border:1px solid rgba(255,255,255,.08); color:var(--tx2); white-space:nowrap;}
+  .chip i{width:5px; height:5px; border-radius:50%; box-shadow:0 0 5px currentColor;}
+  .spark{opacity:.9;}
+  .plan{display:inline-block; font-size:9px; padding:1px 6px; border-radius:5px;
+    background:rgba(167,139,250,.14); color:#c4b5fd; border:1px solid rgba(167,139,250,.25);
+    margin-left:5px; vertical-align:1px; font-weight:500; text-transform:uppercase;}
+
+  #panel footer{display:flex; align-items:center; justify-content:space-between;
+    padding:10px 15px; border-top:1px solid var(--line);}
+  #panel footer .ver{font-size:9.5px; color:var(--tx3); letter-spacing:.03em;}
+  #refreshBtn{border:1px solid var(--line-strong); background:rgba(255,255,255,.06);
+    color:var(--tx); font-size:11px; padding:5px 14px; border-radius:9px; cursor:pointer;
+    display:inline-flex; align-items:center; gap:5px; font-family:inherit;
+    transition:background .15s, transform .1s;}
+  #refreshBtn:hover:not(:disabled){background:rgba(255,255,255,.12);}
+  #refreshBtn:active:not(:disabled){transform:scale(.96);}
+  #refreshBtn:disabled{opacity:.5; cursor:default;}
+  #refreshBtn .spin{display:inline-block; animation:rot 1s linear infinite;}
+  @keyframes rot{to{transform:rotate(360deg);}}
+
+  /* 预览模式（无 pywebview 桥时） */
+  body.demo{background:#0b0d12;}
+  body.demo #stage{padding:36px; align-items:flex-start;}
+  body.demo .demo-tag{position:fixed; top:14px; left:18px; font-size:11px; color:var(--tx3);
+    letter-spacing:.04em;}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="ball" title="点击展开 · 按住拖动">
+    <svg viewBox="0 0 64 64">
+      <circle class="track" cx="32" cy="32" r="27" fill="none" stroke-width="3.5"/>
+      <circle class="prog" id="ring" cx="32" cy="32" r="27" fill="none" stroke-width="3.5"
+        stroke-linecap="round" transform="rotate(-90 32 32)"/>
+    </svg>
+    <div class="center">
+      <div class="pct" id="ballPct">–</div>
+      <div class="sub" id="ballSub"></div>
+    </div>
+    <div id="badge"></div>
+  </div>
+  <div id="panel">
+    <header>
+      <div>
+        <div class="t">额度看板</div>
+        <div class="when" id="when">—</div>
+      </div>
+      <button id="closeBtn" title="收起">✕</button>
+    </header>
+    <div id="rows"></div>
+    <footer>
+      <span class="ver">QUOTABALL · 只读看板</span>
+      <button id="refreshBtn"><span id="refreshIcon">⟳</span><span id="refreshText">刷新</span></button>
+    </footer>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============ 内置样例数据（无桥接的预览模式使用） ============ */
+const SAMPLE = {
+  meta:{fetched_at: Date.now()/1000 - 120},
+  summary:{app_key:"zcode", app:"Zcode", label:"1 周窗口", percent_left:0.0},
+  series:{
+    "workbuddy:笑看红尘***泪飞":[null,null,null,null,null,null,100],
+    "trae:xiao***er":[null,null,null,null,null,null,200],
+    "qoder:xio***ng@juheba.com":[null,null,null,null,null,null,null],
+    "minimax:Mini***51":[null,null,null,null,null,null,1000],
+    "zcode:xiao***er":[null,null,null,null,null,null,0.0]
+  },
+  records:[
+    {app:"workbuddy", app_label:"WorkBuddy", account:"笑看红尘***泪飞", ok:true,
+     checkin:{state:"already", today_gain:100, streak_days:1}, quota:[], absolute:null,
+     plan:null, note:null, error:null},
+    {app:"trae", app_label:"TraeWork CN", account:"xiao***er", ok:true,
+     checkin:{state:"pending", today_gain:null, streak_days:null}, quota:[],
+     absolute:{value:200, unit:"积分"}, plan:null, note:null, error:null},
+    {app:"qoder", app_label:"Qoder CN", account:"xio***ng@juheba.com", ok:true,
+     checkin:{state:"no_activity", today_gain:null, streak_days:null}, quota:[],
+     absolute:null, plan:null, note:null, error:null},
+    {app:"minimax", app_label:"MiniMax Code", account:"Mini***51", ok:true,
+     checkin:{state:"already", today_gain:1000, streak_days:null}, quota:[],
+     absolute:null, plan:null, note:null, error:null},
+    {app:"zcode", app_label:"Zcode", account:"xiao***er", ok:true,
+     checkin:null,
+     quota:[
+       {label:"5 小时窗口", used:0, total:2000, remaining:2000, percent_left:100.0, reset_at:null, unit:"tokens"},
+       {label:"1 周窗口", used:2009, total:2000, remaining:0, percent_left:0.0,
+        reset_at: Date.now()/1000 + 47*3600, unit:"tokens"}
+     ],
+     absolute:null, plan:"lite", note:null, error:null}
+  ]
+};
+
+const ACCENT = {workbuddy:"#60a5fa", trae:"#fb923c", qoder:"#2dd4bf",
+                minimax:"#f472b6", lobster:"#fb7185", zcode:"#a78bfa"};
+const STATE_TXT = {ok:"已领取", already:"已签到", pending:"待签到",
+                   no_activity:"暂无活动", no_session:"登录失效", error:"失败",
+                   quota_exhausted:"额度用尽"};
+const RING_R = 27, RING_C = 2*Math.PI*RING_R;
+
+const $ = id => document.getElementById(id);
+let state = {payload: SAMPLE, expanded:false, flip:false, bridge:false,
+             carouselIdx:0, curItem:null, autoTimer:null, pauseUntil:0};
+
+/* ---------- 工具 ---------- */
+function pctColor(left){ return left<5 ? "#f87171" : left<20 ? "#fbbf24" : "#34d399"; }
+function stateColor(s){
+  if(s==="ok"||s==="already") return "#34d399";
+  if(s==="pending"||s==="quota_exhausted") return "#fbbf24";
+  if(s==="no_activity") return "#98a0ad";
+  return "#f87171";
+}
+function timeAgo(ts){
+  if(!ts) return "—";
+  const m = Math.max(0, Math.round((Date.now()/1000 - ts)/60));
+  if(m<1) return "刚刚更新";
+  if(m<60) return m+" 分钟前更新";
+  const h = Math.floor(m/60);
+  return h+" 小时"+(m%60 ? " " : "")+"前更新";
+}
+function resetIn(ts){
+  if(!ts) return "";
+  let s = Math.max(0, ts - Date.now()/1000);
+  if(s > 3600) return Math.round(s/3600)+"h 后重置";
+  return Math.max(1, Math.round(s/60))+"m 后重置";
+}
+function rid(rec){ return rec.app + (rec.account ? ":"+rec.account : ""); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+/* ---------- sparkline ---------- */
+function spark(vals, color){
+  const W=62, H=20, P=2;
+  const pts = (vals||[]).map(v=>v);
+  if(!pts.some(v=>v!=null)) return "";
+  const ns = pts.filter(v=>v!=null);
+  let lo = Math.min.apply(null,ns), hi = Math.max.apply(null,ns);
+  if(hi===lo){ hi = lo+1; }
+  const x = i => P + i*(W-2*P)/(pts.length-1||1);
+  const y = v => v==null ? null : H-P-(v-lo)/(hi-lo)*(H-2*P);
+  let d="", pen=false;
+  pts.forEach((v,i)=>{
+    if(v==null){pen=false; return;}
+    d += (pen?"L":"M")+x(i).toFixed(1)+" "+y(v).toFixed(1)+" ";
+    pen=true;
+  });
+  return '<svg class="spark" width="'+W+'" height="'+H+'">'+
+    '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.4" '+
+    'stroke-linecap="round" stroke-linejoin="round" opacity=".85"/></svg>';
+}
+
+/* ---------- 渲染 ---------- */
+function renderBall(){
+  // 当前轮播项（无 carousel 时回退到木桶 summary）
+  const cur = state.curItem;
+  const ring = $("ring");
+  if(cur && cur.percent_left!=null){
+    const left = Math.max(0, Math.min(100, cur.percent_left));
+    const c = pctColor(left);
+    ring.setAttribute("stroke", c);
+    ring.style.filter = "drop-shadow(0 0 3.5px "+c+"99)";   // 状态辉光
+    ring.setAttribute("stroke-dasharray", RING_C.toFixed(1));
+    ring.setAttribute("stroke-dashoffset", (RING_C*(1-left/100)).toFixed(1));
+    $("ballPct").textContent = Math.round(left)+"%";
+    $("ballPct").style.color = left<5 ? c : "";
+    $("ballSub").textContent = cur.app + (cur.label ? " · "+cur.label.replace("窗口","") : "");
+  }else if(cur && cur.absolute){
+    // 绝对值型（积分余额）：环显示满格，中间显示数值
+    ring.setAttribute("stroke", "#60a5fa");
+    ring.style.filter = "drop-shadow(0 0 3.5px #60a5fa99)";
+    ring.setAttribute("stroke-dasharray", RING_C.toFixed(1));
+    ring.setAttribute("stroke-dashoffset", RING_C.toFixed(1));   // 满环
+    $("ballPct").textContent = cur.absolute.value;
+    $("ballPct").style.color = "";
+    $("ballSub").textContent = cur.app + " · " + (cur.absolute.unit||"积分");
+  }else{
+    ring.setAttribute("stroke", "#98a0ad");
+    ring.style.filter = "";
+    ring.setAttribute("stroke-dasharray", RING_C.toFixed(1));
+    ring.setAttribute("stroke-dashoffset", RING_C.toFixed(1));
+    $("ballPct").textContent = "–";
+    $("ballPct").style.color = "";
+    $("ballSub").textContent = "";
+  }
+  // 签到聚合：红=失败/失效，黄=有待签，绿=全部完成；异常时球体呼吸
+  const recs = state.payload.records||[];
+  const cis = recs.filter(r=>r.checkin).map(r=>r.checkin.state);
+  const hasBad = recs.some(r=>!r.ok) || cis.some(s2=>s2==="no_session"||s2==="error");
+  const hasPend = cis.some(s2=>s2==="pending");
+  const badge = $("badge");
+  badge.style.background = hasBad ? "#f87171" : hasPend ? "#fbbf24" : "#34d399";
+  document.body.classList.toggle("attn", hasBad || hasPend);
+  document.body.classList.toggle("bad", hasBad);
+}
+
+function rowHTML(rec){
+  const acc = ACCENT[rec.app] || "#60a5fa";
+  const series = (state.payload.series||{})[rid(rec)] || [];
+  const right = [];
+  if(rec.checkin){
+    const st = rec.checkin.state;
+    const sc = stateColor(st);
+    right.push('<span class="chip"><i style="background:'+sc+'; color:'+sc+'"></i>'+
+      (STATE_TXT[st]||st)+'</span>');
+  }
+  right.push(spark(series, acc));
+
+  let metric = "";
+  if(!rec.ok){
+    metric = '<div class="errtext">'+esc(rec.error||"采集失败")+'</div>';
+  }else if(rec.quota && rec.quota.length){
+    metric = rec.quota.map(w=>{
+      const left = w.percent_left==null?100:w.percent_left;
+      const c = pctColor(left);
+      const rst = w.reset_at ? '<span>'+resetIn(w.reset_at)+'</span>' : '';
+      return '<div class="wrow"><div class="wl"><b>'+esc(w.label)+'</b>'+
+        '<span>'+w.used+' / '+w.total+' · 剩 '+left+'%</span></div>'+
+        '<div class="bar"><i style="width:'+(100-left)+'%; background:'+c+'; color:'+c+'"></i></div>'+
+        (rst?'<div class="wl" style="margin-top:2px">'+rst+'</div>':'')+'</div>';
+    }).join("");
+  }else if(rec.absolute && rec.absolute.value!=null){
+    metric = '<div class="absval">'+rec.absolute.value+
+      '<span class="unit">'+esc(rec.absolute.unit||"")+'</span></div>';
+  }
+  if(rec.checkin && rec.checkin.today_gain!=null){
+    metric += '<div class="note">今日 +'+rec.checkin.today_gain+
+      (rec.checkin.streak_days?' · 连续 '+rec.checkin.streak_days+' 天':'')+'</div>';
+  }
+  if(rec.note) metric += '<div class="note">'+esc(rec.note)+'</div>';
+
+  const plan = rec.plan ? '<span class="plan">'+esc(rec.plan)+'</span>' : '';
+  return '<div class="row">'+
+    '<div class="avatar" style="background:linear-gradient(145deg,'+acc+'2e,'+acc+'14); color:'+acc+'">'+
+      esc((rec.app_label||"?").trim().charAt(0))+'</div>'+
+    '<div><div class="name">'+esc(rec.app_label)+plan+'</div>'+
+    '<div class="acct">'+esc(rec.account||"")+'</div>'+
+    '<div class="metric">'+metric+'</div></div>'+
+    '<div class="right">'+right.join("")+'</div></div>';
+}
+
+function renderPanel(){
+  $("rows").innerHTML = (state.payload.records||[]).map(rowHTML).join("");
+  tick();
+}
+
+function tick(){ $("when").textContent = timeAgo(state.payload.meta && state.payload.meta.fetched_at); }
+setInterval(tick, 30000);
+
+function renderAll(){ renderBall(); renderPanel(); }
+
+/* ---------- 球体轮播 ---------- */
+/* 切换即刷新：切到某一家时，只刷新这一家（单家刷新），拿到结果再更新数字。 */
+const CAROUSEL_INTERVAL = 8000;      // 自动轮播间隔（毫秒）
+const CAROUSEL_HOVER_PAUSE = 4000;   // 手动切换后暂停自动轮播时长（毫秒）
+
+function buildCarousel(){
+  // 从 payload.carousel 取队列；无队列时回退到 summary 单条
+  const list = state.payload.carousel || [];
+  if(list.length) return list;
+  if(state.payload.summary && state.payload.summary.percent_left!=null)
+    return [state.payload.summary];
+  return [];
+}
+
+function applyCurItem(){
+  const list = buildCarousel();
+  if(!list.length){
+    state.curItem = null;
+    return;
+  }
+  state.carouselIdx = ((state.carouselIdx % list.length) + list.length) % list.length;
+  state.curItem = list[state.carouselIdx];
+}
+
+/* 切到下一家：更新显示 + 触发单家刷新 */
+function nextCarousel(manual){
+  const list = buildCarousel();
+  if(!list.length) return;
+  state.carouselIdx = (state.carouselIdx + 1) % list.length;
+  applyCurItem();
+  renderBall();
+  if(manual){
+    state.pauseUntil = Date.now() + CAROUSEL_HOVER_PAUSE;
+    scheduleAuto();
+  }
+  refreshCurrent();
+}
+
+/* 刷新当前显示的那一家（单家） */
+function refreshCurrent(){
+  if(!state.bridge || !state.curItem) return;
+  const key = state.curItem.app_key;
+  if(!key) return;
+  window.pywebview.api.refresh(true, key).then(p=>{
+    state.payload = p;
+    // 刷新后重新对齐当前项（数据可能变化，按 app_key 找回）
+    const list = buildCarousel();
+    const idx = list.findIndex(c=>c.app_key===key);
+    if(idx>=0){ state.carouselIdx = idx; applyCurItem(); }
+    renderAll();
+  }).catch(()=>{});
+}
+
+function scheduleAuto(){
+  if(state.autoTimer) clearInterval(state.autoTimer);
+  state.autoTimer = setInterval(()=>{
+    if(state.expanded) return;               // 展开时不自动转（面板在交互）
+    if(Date.now() < state.pauseUntil) return; // 手动切换后的暂停期
+    nextCarousel(false);
+  }, CAROUSEL_INTERVAL);
+}
+
+/* 滚轮手动切换球体显示 */
+(function wheelSwitch(){
+  document.addEventListener("wheel", e=>{
+    if(state.expanded) return;               // 面板展开时滚轮交给面板滚动
+    if(e.deltaY===0) return;
+    e.preventDefault();
+    nextCarousel(true);
+  }, {passive:false});
+})();
+
+/* 后台采集完成 → Python 主动推送新快照 */
+window.__pushPayload = function(p){
+  state.payload = p;
+  applyCurItem();
+  renderAll();
+};
+
+/* ---------- 展开 / 收起 ---------- */
+function expand(){
+  state.expanded = true;
+  document.body.classList.add("expanded");
+  renderPanel();
+  requestAnimationFrame(()=>{
+    const p = $("panel");
+    if(state.bridge){
+      window.pywebview.api.expand(p.offsetWidth, p.offsetHeight, window.devicePixelRatio||1)
+        .then(mode=>{ state.flip = (mode==="flip"); $("stage").classList.toggle("flip", state.flip); });
+    }
+  });
+}
+function collapse(){
+  if(state.bridge){
+    window.pywebview.api.collapse(window.devicePixelRatio||1);
+  }
+  state.expanded = false;
+  state.flip = false;                     // 窗口收回 76x76，flip 失效
+  $("stage").classList.remove("flip");
+  document.body.classList.remove("expanded");
+}
+function toggle(){ state.expanded ? collapse() : expand(); }
+
+/* ---------- 事件 ---------- */
+/* 拖拽：mousedown 记屏坐标起点，document 级 mousemove 报增量（1px 去重），
+   Python 侧 window.move 跟随。 */
+(function ballEvents(){
+  const ball = $("ball");
+  let sx=0, sy=0, moved=false, down=false, lx=0, ly=0;
+  ball.addEventListener("mousedown", e=>{
+    if(e.button!==0) return;
+    down=true; moved=false; sx=e.screenX; sy=e.screenY; lx=sx; ly=sy;
+    if(state.bridge) window.pywebview.api.drag_begin();
+  });
+  document.addEventListener("mousemove", e=>{
+    if(!down) return;
+    const dx = e.screenX - sx, dy = e.screenY - sy;
+    if(!moved){
+      if(Math.hypot(dx, dy) > 4) moved = true;
+      else return;
+    }
+    if(state.bridge && (Math.abs(e.screenX-lx)>=1 || Math.abs(e.screenY-ly)>=1)){
+      lx = e.screenX; ly = e.screenY;
+      window.pywebview.api.drag_move(Math.round(dx), Math.round(dy));
+    }
+  });
+  document.addEventListener("mouseup", ()=>{ down=false; });
+  ball.addEventListener("click", ()=>{ if(!moved) toggle(); });
+})();
+
+$("closeBtn").addEventListener("click", collapse);
+$("stage").addEventListener("click", e=>{ if(state.expanded && e.target.id==="stage") collapse(); });
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") collapse(); });
+
+$("refreshBtn").addEventListener("click", ()=>{
+  if(!state.bridge) return;
+  const btn = $("refreshBtn");
+  btn.disabled = true;
+  $("refreshIcon").innerHTML = '<span class="spin">⟳</span>';
+  $("refreshText").textContent = "刷新中";
+  window.pywebview.api.refresh(true).then(p=>{
+    state.payload = p; renderAll();
+  }).finally(()=>{
+    btn.disabled = false;
+    $("refreshIcon").textContent = "⟳";
+    $("refreshText").textContent = "刷新";
+  });
+});
+
+/* ---------- 启动 ---------- */
+function boot(){
+  window.__hb = true;
+  if(window.pywebview && window.pywebview.api){
+    state.bridge = true;
+    window.pywebview.api.get_payload().then(p=>{
+      state.payload = p; applyCurItem(); renderAll(); scheduleAuto();
+    }).catch(e=>{ window.__bootErr = String(e); });
+    setInterval(()=>{                      // 15 分钟自动刷新（采集层另有节流）
+      window.pywebview.api.refresh(false).then(p=>{
+        state.payload=p; applyCurItem(); renderAll();
+      });
+    }, 15*60*1000);
+    setInterval(()=>{ window.pywebview.api.heartbeat(); }, 30000);  // 页面存活心跳
+  }else{
+    document.body.classList.add("demo");
+    const tag = document.createElement("div");
+    tag.className = "demo-tag";
+    tag.textContent = "预览模式 · 真实数据样例";
+    document.body.appendChild(tag);
+    applyCurItem();
+    renderAll();
+    setTimeout(()=>expand(), 300);        // 预览时自动展开
+  }
+}
+renderBall();
+/* 桥就绪：pywebviewready 事件存在竞争丢失风险，事件 + 轮询双保险 */
+let booted = false;
+function bootOnce(){
+  if(!booted && window.pywebview && window.pywebview.api){
+    booted = true;
+    window.__booted = true;
+    boot();
+  }
+}
+function waitBridge(){
+  bootOnce();
+  if(!booted) setTimeout(waitBridge, 100);
+}
+window.addEventListener("pywebviewready", bootOnce);
+setTimeout(waitBridge, 80);
+</script>
+</body>
+</html>
