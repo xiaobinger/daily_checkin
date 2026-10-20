@@ -9,9 +9,9 @@ AIGC:
     ReservedCode2: +JBfoaKxI4thEdL+29kn9nHo9WAvnqlh8/bgRkZebgamhXfmcpKPWbsQsLKckSuOakHb+h0vyWbIqKWB7vz6KmsnTMLI3N9otrz+9YgdicW1+Wf0stdQ+8YlWiV5gHy3FRWJlPVM/vjjZ/Vf4PfH6WxvEMVz+Ct6GdtKredwDzVLgAaxa215KDeIeMQ=
 ---
 
-# TraeWorkCN + WorkBuddy + MiniMax Code + Qoder CN 每日自动签到
+# TraeWorkCN + WorkBuddy + MiniMax Code + Qoder CN + LobsterAI 每日自动签到
 
-一个脚本同时覆盖四个应用的每日签到/积分领取，只依赖 Python 标准库，无第三方包。
+一个脚本同时覆盖五个应用的每日签到/积分领取，只依赖 Python 标准库，无第三方包。
 
 ## 文件说明
 
@@ -21,6 +21,8 @@ AIGC:
 | `trae_login.py` | TraeWorkCN 凭证获取脚本（纯 Python，一次性使用） |
 | `auths/` | TraeWorkCN 凭证目录（放 `trae-*.json`） |
 | `checkin.log` | 每次运行自动追加日志 |
+| `quotaball/` | 采集层（悬浮球用，只读快照） |
+| `tools/` | 辅助工具：`wb_extract.js`（WorkBuddy 密钥提取）、`wb_cache_key.py`（DPAPI 缓存密钥）、`mm_sign_check.py`（MiniMax 签名回归自检） |
 
 ## 运行方式
 
@@ -30,6 +32,7 @@ python daily_checkin.py --workbuddy-only
 python daily_checkin.py --trae-only
 python daily_checkin.py --minimax-only
 python daily_checkin.py --qoder-only
+python daily_checkin.py --lobster-only
 python daily_checkin.py --check-only   :: 只查状态，不领取
 ```
 
@@ -89,13 +92,43 @@ python trae_login.py
 
 ## 3. MiniMax Code（开箱即用）
 
-依赖本机 MiniMax Code 桌面端登录态文件（默认 `%APPDATA%\MiniMax\minimax-agent-cn-config.json`）。
+依赖本机 MiniMax Code 桌面端登录态。
 
-> **3.1 版本起 token 换了位置**：桌面端配置里的 `tokens` 已被清空，
-> 实际 token 在 `%USERPROFILE%\.minimax\local-runtime.auth.json` 的 `auth.accessToken`。
-> 脚本两个来源都会读，先桌面端配置、后本地运行时登录态。
+> **3.1 版本起换成了 OAuth 设备码流**，凭证明文在
+> `%USERPROFILE%\.minimax\auth\<buildEnv>\<region>\mcode-public\auth.json`，
+> 里面是 `records[<service>\0<account>]`：
+> `accessToken`（`mmoat_` 前缀，**只有 35~60 分钟有效期**）、`refreshToken`（`mmort_` 前缀）、`expiresAtMs`、`generation`。
+>
+> 旧的 `local-runtime.auth.json`（JWT）自 2026-09-04 起就没再更新，2026-10-14 过期，
+> 所以 10-15 起每天 401。
 
-accessToken 为客户端签发 JWT（约 7 天有效），过期后需打开一次 MiniMax Code 让客户端续签。脚本复现桌面端请求签名（`x-signature = md5(unix秒 + salt + body)` + 设备参数），每日领取 400+ 积分。签到接口幂等，重复领取返回同一 `claim_id`，脚本同时以本地 `claim_id` 记录做二次去重。
+脚本会自己续期，不用开客户端：临近过期就用 `refreshToken` 调
+`POST https://account.minimax.cn/oauth2/token`（`grant_type=refresh_token`，`client_id=mcode-public`）
+换新的 `accessToken`，并原子写回 `auth.json`（服务端同时下发新的 refreshToken，旧的不会失效）。
+逻辑见 `quotaball/mmauth.py`。
+
+请求签名也复刻了 3.1 桌面端（逆向自 `app.asar`）：
+
+```
+Authorization: Bearer <accessToken>
+yy          = md5(encodeURIComponent(path + "?" + URLSearchParams(params)) + "_" + yyBody
+                  + md5(str(time_ms)) + "ooui")
+x-timestamp = floor(time_ms / 1000)
+x-signature = md5(str(second) + "I*7Cf%WZ#S&%1RlZJ&C2" + bodyText)
+```
+
+两个容易踩的坑：
+
+- 签名串里的 `params` 是 `URLSearchParams` 序列化结果，**包含** `op_ticket=undefined` 与
+  `token=null`；真正发到服务器的 URL 由 axios 序列化，会跳过这两个 null/undefined 键。两串本来就不一样。
+- `time_ms = Date.parse(new Date().toString())` 只到秒精度，所以 `unix` 参数和签名时间戳都是整秒 × 1000。
+
+设备指纹（`uuid` / `device_id` / `user_id` / 屏幕尺寸等）会随安装变化，脚本每次从桌面端最新
+API 日志 `%APPDATA%\MiniMax\logs\api-*.log` 里抄一份真实 query 回来，按客户端的固定顺序重建。
+
+接口：`GET /minimax-cloud/api/v1/signin/status` 查状态、`POST /minimax-cloud/api/v1/signin/claim` 领取
+（body `{}`），每日 400+ 积分。签到接口幂等，重复领取不会重复计分；脚本以服务端返回的
+`status==3`（当日已领）为准，辅以本地 `claim_id` 记录做二次去重。
 
 只要桌面端登录过即可直接运行，无需额外配置。
 

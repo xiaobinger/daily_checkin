@@ -3,7 +3,10 @@
 """MiniMax Code：读本机登录态，复现桌面端签名，查询 7 日签到日历。
 
 实测（S0）：signin/status 只有 days 数组，无余额接口。status==3 表示当日已领取。
-签名与请求逻辑直接复用 daily_checkin.py 的 mm_request（md5(unix+salt+body)），不重写。
+
+3.1 桌面端改用 OAuth（~/.minimax/auth/**/mcode-public/auth.json），accessToken
+是 mmoat_ 前缀的短期凭证，请求带 Authorization: Bearer + yy/x-timestamp/x-signature。
+签名与取 token 都在 quotaball/mmauth.py，请求复用 daily_checkin.py 的 mm_request。
 """
 import json
 import time
@@ -65,26 +68,30 @@ class MiniMaxProvider(Provider):
     def fetch(self):
         started = time.time()
         cfg_path = dc.mm_find_config()
-        if not cfg_path:
-            raise NoSessionError("未找到 MiniMax Code 登录态，请先登录桌面端")
-        try:
-            cfg = json.load(open(cfg_path, encoding="utf-8"))
-            token = dc.mm_load_token(cfg)
-            if not token:
-                raise ValueError("登录态缺少 accessToken（桌面端配置与 .minimax/local-runtime.auth.json 都没有）")
-        except Exception as e:
-            raise NoSessionError("MiniMax Code 登录态解析失败: %s" % e)
+        cfg = {}
+        if cfg_path:
+            try:
+                cfg = json.load(open(cfg_path, encoding="utf-8"))
+            except Exception as e:
+                raise NoSessionError("MiniMax Code 登录态解析失败: %s" % e)
 
-        # accessToken 为客户端签发 JWT（约 7 天），过期需打开客户端续签
-        try:
-            _, _, payload = token.split(".")
-            exp_ts = dc.mm_jwt_exp(payload)
-            if exp_ts and time.time() >= exp_ts:
-                raise NoSessionError("MiniMax Code accessToken 已过期，请打开客户端续签")
-        except NoSessionError:
-            raise
-        except Exception:
-            pass
+        # 3.1 的凭证在 OAuth 文件里（accessToken 有效期只有几十分钟，
+        # 过期时用 refreshToken 换新的），配置缺失也不影响
+        token, source = dc.mm_load_token(cfg)
+        if not token:
+            raise NoSessionError("MiniMax Code 缺少 accessToken（%s）" % source)
+
+        # mmoat_ 令牌的新鲜度由 mmauth.access_token() 保证；旧版 JWT 自带 exp
+        if not token.startswith("mmoat_"):
+            try:
+                _, _, payload = token.split(".")
+                exp_ts = dc.mm_jwt_exp(payload)
+                if exp_ts and time.time() >= exp_ts:
+                    raise NoSessionError("MiniMax Code accessToken 已过期，请打开客户端续签")
+            except NoSessionError:
+                raise
+            except Exception:
+                pass
 
         code, body = dc.mm_request(cfg, token, "/minimax-cloud/api/v1/signin/status")
         if code in (401, 400):

@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TraeWorkCN (TRAE SOLO CN) + WorkBuddy + MiniMax Code + Qoder CN 每日自动签到脚本
+TraeWorkCN (TRAE SOLO CN) + WorkBuddy + MiniMax Code + Qoder CN + LobsterAI 每日自动签到脚本
 ===============================================================================
 功能：
-  1. WorkBuddy    —— 读取本机桌面端登录态，调官方签到接口领取每日积分（开箱即用）
+  1. WorkBuddy    —— 读取本机桌面端登录态（5.7+ 走 AES-GCM 信封解密），调官方签到接口
+                     领取每日 100 积分（开箱即用）
   2. TraeWorkCN   —— 读取 auths/trae-*.json 凭证（traework2api 兼容格式），调官方签到接口
                      领取每日 Work 专属积分；accessToken 临近过期时自动用 refreshToken 轮换
-  3. MiniMax Code —— 读取本机登录态 minimax-agent-cn-config.json，复现桌面端请求
-                     （x-signature = md5(unix秒 + salt + body) + 设备参数）领取每日 400+ 积分
+  3. MiniMax Code —— 读取 3.1 桌面端的 OAuth 登录态（~/.minimax/auth/**/auth.json），
+                     临近过期自动用 refreshToken 续期，复现桌面端签名
+                     （Authorization: Bearer + yy / x-timestamp / x-signature）领取每日 400+ 积分
   4. Qoder CN     —— 读取本机 Qoder CN / QoderWork CN 登录态（Chromium vscdb + AES-GCM 解密），
                      调 openapi.qoder.com.cn 活动接口领取每日 Credits 资源包
+  5. LobsterAI    —— 读取桌面端 sqlite 库 %APPDATA%\\LobsterAI\\lobsterai.sqlite 的登录态，
+                     调 youdao 活动接口领取每日 100 credits
 
 用法：
-  python daily_checkin.py                 # 四个应用都签到
+  python daily_checkin.py                 # 五个应用都签到
   python daily_checkin.py --workbuddy-only
   python daily_checkin.py --trae-only
   python daily_checkin.py --minimax-only
   python daily_checkin.py --qoder-only
+  python daily_checkin.py --lobster-only
   python daily_checkin.py --check-only    # 只查询今日签到状态，不执行领取
 
 依赖：Python 3.6+，仅标准库，无第三方包。
@@ -29,10 +34,10 @@ TraeWorkCN 凭证获取（一次性）：
           {"accessToken": "...", "refreshToken": "...", "deviceId": "...", "expiresAt": 0, "uid": "..."}
 
 MiniMax Code 说明：
-  依赖本机登录态文件（默认 %APPDATA%\\MiniMax\\minimax-agent-cn-config.json）。
-  accessToken 为客户端签发 JWT（约 7 天有效），过期后需打开一次 MiniMax Code 让客户端续签。
-  签到接口每日幂等（重复领取返回同一 claim_id，不重复计分），脚本同时以本地 claim_id
-  记录做二次去重。
+  3.1 桌面端用 OAuth 设备码流，accessToken（mmoat_ 前缀）只有 35~60 分钟有效期，
+  脚本用 refreshToken（mmort_ 前缀）自行续期并写回，无需打开客户端。
+  签到接口每日幂等（重复领取不重复计分），脚本以服务端 status==3 为准，
+  同时以本地 claim_id 记录做二次去重。
 """
 import ctypes
 import glob
@@ -49,6 +54,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from quotaball import mmauth  # noqa: E402  MiniMax Code 3.1 登录态与请求签名
 from quotaball import wbatrest  # noqa: E402  WorkBuddy 5.7+ 登录态信封解密
 
 # SSL context 全局单例：ssl.create_default_context() 在 Windows 上并发调用会
@@ -96,12 +102,14 @@ APPDATA = os.environ.get("APPDATA", "")
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 
 CHECK_ONLY = "--check-only" in sys.argv
-DO_WORKBUDDY = "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
-DO_TRAE = "--workbuddy-only" not in sys.argv and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
-DO_MINIMAX = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--qoder-only" not in sys.argv
-DO_QODER = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv and "--minimax-only" not in sys.argv
-DO_LOBSTER = "--workbuddy-only" not in sys.argv and "--trae-only" not in sys.argv \
-    and "--minimax-only" not in sys.argv and "--qoder-only" not in sys.argv
+_ONLY_FLAGS = ("--workbuddy-only", "--trae-only", "--minimax-only",
+               "--qoder-only", "--lobster-only")
+_others = {f: [g for g in _ONLY_FLAGS if g != f] for f in _ONLY_FLAGS}
+DO_WORKBUDDY = not any(g in sys.argv for g in _others["--workbuddy-only"])
+DO_TRAE = not any(g in sys.argv for g in _others["--trae-only"])
+DO_MINIMAX = not any(g in sys.argv for g in _others["--minimax-only"])
+DO_QODER = not any(g in sys.argv for g in _others["--qoder-only"])
+DO_LOBSTER = not any(g in sys.argv for g in _others["--lobster-only"])
 
 
 def log(msg):
@@ -470,22 +478,34 @@ def mm_find_runtime_auth():
 
 
 def mm_load_token(cfg):
-    """取 accessToken：桌面端配置优先，其次本地运行时登录态。
+    """取 accessToken。
 
-    实测（2026-10-12）：3.1 桌面端把 tokens 清空了，token 只留在
-    ~/.minimax/local-runtime.auth.json（auth.accessToken）。两个来源都试一遍。
+    3.1 桌面端改用 OAuth 设备码流，凭证在
+        ~/.minimax/auth/<env>/<region>/mcode-public/auth.json
+    里面 accessToken（mmoat_ 前缀）只有 35~60 分钟有效期，
+    由 mmauth.access_token() 在过期前用 refreshToken 换新的。
+
+    旧版 3.0 的 JWT 曾在桌面端配置或 .minimax/local-runtime.auth.json，
+    现在早已过期，只作兜底。
+
+    返回 (token, 来源说明)；没有 token 时返回 (None, 原因)。
     """
+    token, note = mmauth.access_token()
+    if token:
+        return token, note
     token = (cfg.get("tokens") or {}).get("accessToken")
     if token:
-        return token
+        return token, "旧版桌面端配置"
     path = mm_find_runtime_auth()
-    if not path:
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return ((json.load(f) or {}).get("auth") or {}).get("accessToken")
-    except Exception:
-        return None
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                token = ((json.load(f) or {}).get("auth") or {}).get("accessToken")
+            if token:
+                return token, "旧版本地运行时登录态"
+        except Exception:
+            pass
+    return None, note
 
 
 def mm_jwt_exp(payload):
@@ -506,6 +526,7 @@ def mm_sign(unix_sec, body):
 
 
 def mm_build_params(cfg, token):
+    """旧版 3.0 的公共参数（3.1 已改用 mmauth）。"""
     user = cfg.get("user") or {}
     ts_ms = int(time.time() * 1000)
     ts = ts_ms // 1000
@@ -529,7 +550,35 @@ def mm_build_params(cfg, token):
     return ts_ms, ts, params
 
 
+def _mm_request_v31(token, path, method="GET", body=""):
+    """3.1 请求：Authorization: Bearer + yy/x-timestamp/x-signature。"""
+    payload = None
+    if (method or "GET").upper() == "POST":
+        payload = body if body else "{}"
+    url, headers, data = mmauth.build_request(path, method=method, body=payload, token=token)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    ctx = _default_ssl_context()
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw)
+            except Exception:
+                return resp.status, {"raw": raw[:500]}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"raw": raw[:500]}
+    except Exception as e:
+        return -1, {"error": str(e)}
+
+
 def mm_request(cfg, token, path, method="GET", body=""):
+    """发一次请求。mmoat_ 令牌走 3.1 协议，旧版 JWT 走 3.0 协议。"""
+    if token and token.startswith("mmoat_"):
+        return _mm_request_v31(token, path, method, body)
     ts_ms, ts, params = mm_build_params(cfg, token)
     url = MINIMAX_HOST + path + "?" + urllib.parse.urlencode(params)
     headers = {
@@ -589,25 +638,32 @@ def mm_save_state(rec):
 
 def minimax_checkin():
     cfg_path = mm_find_config()
-    if not cfg_path:
-        return {"app": "MiniMaxCode", "result": "NO_SESSION",
-                "report": "未找到 MiniMax Code 登录态（%s），请先登录桌面端" % MINIMAX_CONFIG_BASENAME}
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        token = mm_load_token(cfg)
-        if not token:
-            raise RuntimeError("登录态缺少 accessToken（已找过桌面端配置与 .minimax/local-runtime.auth.json）")
-    except Exception as e:
-        return {"app": "MiniMaxCode", "result": "ERROR",
-                "report": "解析登录态失败: %s" % e}
+    # 3.1 的凭证在 OAuth 文件里，没有桌面端配置也能签到
+    cfg = {}
+    if cfg_path:
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            return {"app": "MiniMaxCode", "result": "ERROR",
+                    "report": "解析登录态失败: %s" % e}
 
-    # token 有效性
-    _, _, exp = token.split(".")
-    exp_ts = mm_jwt_exp(exp)
-    if exp_ts and time.time() >= exp_ts:
+    token, source = mm_load_token(cfg)
+    if not token:
         return {"app": "MiniMaxCode", "result": "NO_SESSION",
-                "report": "accessToken 已过期，请打开一次 MiniMax Code 让客户端续签后重试"}
+                "report": "缺少 accessToken（%s）；请先登录 MiniMax Code 桌面端" % source}
+
+    # 令牌有效期：mmoat_ 令牌由 mmauth.access_token() 保证新鲜（必要时已刷新）；
+    # 旧版 JWT 自带 exp
+    if not token.startswith("mmoat_"):
+        try:
+            _, _, exp = token.split(".")
+            exp_ts = mm_jwt_exp(exp)
+            if exp_ts and time.time() >= exp_ts:
+                return {"app": "MiniMaxCode", "result": "NO_SESSION",
+                        "report": "accessToken 已过期，请打开一次 MiniMax Code 让客户端续签后重试"}
+        except Exception:
+            pass
 
     # 查询状态
     scode, sbody = mm_request(cfg, token, "/minimax-cloud/api/v1/signin/status")
@@ -626,13 +682,22 @@ def minimax_checkin():
     days = ((sbody.get("data") or {}).get("days")) or []
     today = next((d for d in days if d.get("is_today")), None)
     today_points = (today or {}).get("points", 0)
+    # 服务端 status==3 表示当日已领取（比本地 state 更权威，
+    # 用户在客户端手动签过的情况本地是看不到的）
+    server_done = (today or {}).get("status") == 3
 
     if CHECK_ONLY:
         state = mm_load_state()
         done = state.get("date") == time.strftime("%Y-%m-%d")
-        return {"app": "MiniMaxCode", "result": "ALREADY" if done else "NOT_YET",
-                "report": (("今日已签到（+%s 积分）" % today_points) if done
-                           else "今日尚未签到（可领 +%s 积分）" % today_points)}
+        if server_done or done:
+            return {"app": "MiniMaxCode", "result": "ALREADY",
+                    "report": "今日已签到（+%s 积分）" % today_points}
+        return {"app": "MiniMaxCode", "result": "NOT_YET",
+                "report": "今日尚未签到（可领 +%s 积分）" % today_points}
+
+    if server_done:
+        return {"app": "MiniMaxCode", "result": "ALREADY",
+                "report": "今日已签到（+%s 积分）" % today_points}
 
     # 本地 claim_id 去重（二次幂等）
     state = mm_load_state()
